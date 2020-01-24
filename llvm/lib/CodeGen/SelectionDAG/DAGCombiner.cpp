@@ -10788,13 +10788,12 @@ SDValue DAGCombiner::visitTRUNCATE(SDNode *N) {
     SDValue EltNo = N0->getOperand(1);
     if (isa<ConstantSDNode>(EltNo) && isTypeLegal(NVT)) {
       int Elt = cast<ConstantSDNode>(EltNo)->getZExtValue();
-      EVT IndexTy = TLI.getVectorIdxTy(DAG.getDataLayout());
       int Index = isLE ? (Elt*SizeRatio) : (Elt*SizeRatio + (SizeRatio-1));
 
       SDLoc DL(N);
       return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, TrTy,
                          DAG.getBitcast(NVT, N0.getOperand(0)),
-                         DAG.getConstant(Index, DL, IndexTy));
+                         DAG.getVectorIdxConstant(Index, DL));
     }
   }
 
@@ -10961,10 +10960,9 @@ SDValue DAGCombiner::visitTRUNCATE(SDNode *N) {
          TLI.isOperationLegal(ISD::EXTRACT_VECTOR_ELT, VecSrcVT))) {
       SDLoc SL(N);
 
-      EVT IdxVT = TLI.getVectorIdxTy(DAG.getDataLayout());
       unsigned Idx = isLE ? 0 : VecSrcVT.getVectorNumElements() - 1;
       return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, SL, VT, VecSrc,
-                         DAG.getConstant(Idx, SL, IdxVT));
+                         DAG.getVectorIdxConstant(Idx, SL));
     }
   }
 
@@ -12639,6 +12637,15 @@ SDValue DAGCombiner::visitFMA(SDNode *N) {
     }
   }
 
+  // fold ((fma (fneg X), Y, (fneg Z)) -> fneg (fma X, Y, Z))
+  // fold ((fma X, (fneg Y), (fneg Z)) -> fneg (fma X, Y, Z))
+  if (!TLI.isFNegFree(VT) &&
+      TLI.isNegatibleForFree(SDValue(N, 0), DAG, LegalOperations,
+                             ForCodeSize) == 2)
+    return DAG.getNode(ISD::FNEG, DL, VT,
+                       TLI.getNegatedExpression(SDValue(N, 0), DAG,
+                                                LegalOperations, ForCodeSize),
+                       Flags);
   return SDValue();
 }
 
@@ -15731,7 +15738,14 @@ bool DAGCombiner::MergeConsecutiveStores(StoreSDNode *St) {
   if (OptLevel == CodeGenOpt::None || !EnableStoreMerging)
     return false;
 
+  // TODO: Extend this function to merge stores of scalable vectors.
+  // (i.e. two <vscale x 8 x i8> stores can be merged to one <vscale x 16 x i8>
+  // store since we know <vscale x 16 x i8> is exactly twice as large as
+  // <vscale x 8 x i8>). Until then, bail out for scalable vectors.
   EVT MemVT = St->getMemoryVT();
+  if (MemVT.isScalableVector())
+    return false;
+
   int64_t ElementSizeBytes = MemVT.getStoreSize();
   unsigned NumMemElts = MemVT.isVector() ? MemVT.getVectorNumElements() : 1;
 
@@ -17093,6 +17107,10 @@ SDValue DAGCombiner::visitEXTRACT_VECTOR_ELT(SDNode *N) {
 
   // (vextract (scalar_to_vector val, 0) -> val
   if (VecOp.getOpcode() == ISD::SCALAR_TO_VECTOR) {
+    // Only 0'th element of SCALAR_TO_VECTOR is defined.
+    if (DAG.isKnownNeverZero(Index))
+      return DAG.getUNDEF(ScalarVT);
+
     // Check if the result type doesn't match the inserted element type. A
     // SCALAR_TO_VECTOR may truncate the inserted element and the
     // EXTRACT_VECTOR_ELT may widen the extracted vector.
@@ -17206,9 +17224,8 @@ SDValue DAGCombiner::visitEXTRACT_VECTOR_ELT(SDNode *N) {
         // FIXME: Should really be just isOperationLegalOrCustom.
         TLI.isOperationLegal(ISD::EXTRACT_VECTOR_ELT, VecVT) ||
         TLI.isOperationExpand(ISD::VECTOR_SHUFFLE, VecVT)) {
-      EVT IndexTy = TLI.getVectorIdxTy(DAG.getDataLayout());
       return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, ScalarVT, SVInVec,
-                         DAG.getConstant(OrigElt, DL, IndexTy));
+                         DAG.getVectorIdxConstant(OrigElt, DL));
     }
   }
 
@@ -17448,8 +17465,7 @@ SDValue DAGCombiner::createBuildVecShuffle(const SDLoc &DL, SDNode *N,
                                            ArrayRef<int> VectorMask,
                                            SDValue VecIn1, SDValue VecIn2,
                                            unsigned LeftIdx, bool DidSplitVec) {
-  MVT IdxTy = TLI.getVectorIdxTy(DAG.getDataLayout());
-  SDValue ZeroIdx = DAG.getConstant(0, DL, IdxTy);
+  SDValue ZeroIdx = DAG.getVectorIdxConstant(0, DL);
 
   EVT VT = N->getValueType(0);
   EVT InVT1 = VecIn1.getValueType();
@@ -17483,7 +17499,7 @@ SDValue DAGCombiner::createBuildVecShuffle(const SDLoc &DL, SDNode *N,
         // If we only have one input vector, and it's twice the size of the
         // output, split it in two.
         VecIn2 = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, VT, VecIn1,
-                             DAG.getConstant(NumElems, DL, IdxTy));
+                             DAG.getVectorIdxConstant(NumElems, DL));
         VecIn1 = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, VT, VecIn1, ZeroIdx);
         // Since we now have shorter input vectors, adjust the offset of the
         // second vector's start.
@@ -17724,7 +17740,6 @@ SDValue DAGCombiner::reduceBuildVecToShuffle(SDNode *N) {
     unsigned NearestPow2 = 0;
     SDValue Vec = VecIn.back();
     EVT InVT = Vec.getValueType();
-    MVT IdxTy = TLI.getVectorIdxTy(DAG.getDataLayout());
     SmallVector<unsigned, 8> IndexVec(NumElems, 0);
 
     for (unsigned i = 0; i < NumElems; i++) {
@@ -17743,9 +17758,9 @@ SDValue DAGCombiner::reduceBuildVecToShuffle(SDNode *N) {
                                      InVT.getVectorElementType(), SplitSize);
       if (TLI.isTypeLegal(SplitVT)) {
         SDValue VecIn2 = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, SplitVT, Vec,
-                                     DAG.getConstant(SplitSize, DL, IdxTy));
+                                     DAG.getVectorIdxConstant(SplitSize, DL));
         SDValue VecIn1 = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, SplitVT, Vec,
-                                     DAG.getConstant(0, DL, IdxTy));
+                                     DAG.getVectorIdxConstant(0, DL));
         VecIn.pop_back();
         VecIn.push_back(VecIn1);
         VecIn.push_back(VecIn2);
@@ -18403,12 +18418,11 @@ static SDValue narrowExtractedVectorBinOp(SDNode *Extract, SelectionDAG &DAG) {
   // bitcasted.
   unsigned ConcatOpNum = ExtractIndex / VT.getVectorNumElements();
   unsigned ExtBOIdx = ConcatOpNum * NarrowBVT.getVectorNumElements();
-  EVT ExtBOIdxVT = Extract->getOperand(1).getValueType();
   if (TLI.isExtractSubvectorCheap(NarrowBVT, WideBVT, ExtBOIdx) &&
       BinOp.hasOneUse() && Extract->getOperand(0)->hasOneUse()) {
     // extract (binop B0, B1), N --> binop (extract B0, N), (extract B1, N)
     SDLoc DL(Extract);
-    SDValue NewExtIndex = DAG.getConstant(ExtBOIdx, DL, ExtBOIdxVT);
+    SDValue NewExtIndex = DAG.getVectorIdxConstant(ExtBOIdx, DL);
     SDValue X = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NarrowBVT,
                             BinOp.getOperand(0), NewExtIndex);
     SDValue Y = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NarrowBVT,
@@ -18448,7 +18462,7 @@ static SDValue narrowExtractedVectorBinOp(SDNode *Extract, SelectionDAG &DAG) {
     // extract (binop (concat X1, X2), Y), N --> binop XN, (extract Y, IndexC)
     // extract (binop X, (concat Y1, Y2)), N --> binop (extract X, IndexC), YN
     SDLoc DL(Extract);
-    SDValue IndexC = DAG.getConstant(ExtBOIdx, DL, ExtBOIdxVT);
+    SDValue IndexC = DAG.getVectorIdxConstant(ExtBOIdx, DL);
     SDValue X = SubVecL ? DAG.getBitcast(NarrowBVT, SubVecL)
                         : DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NarrowBVT,
                                       BinOp.getOperand(0), IndexC);
@@ -18541,7 +18555,7 @@ SDValue DAGCombiner::visitEXTRACT_SUBVECTOR(SDNode *N) {
       if (TLI.isOperationLegalOrCustom(ISD::EXTRACT_SUBVECTOR, NewExtVT)) {
         unsigned IndexValScaled = N->getConstantOperandVal(1) * SrcDestRatio;
         SDLoc DL(N);
-        SDValue NewIndex = DAG.getIntPtrConstant(IndexValScaled, DL);
+        SDValue NewIndex = DAG.getVectorIdxConstant(IndexValScaled, DL);
         SDValue NewExtract = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NewExtVT,
                                          V.getOperand(0), NewIndex);
         return DAG.getBitcast(NVT, NewExtract);
@@ -18551,34 +18565,58 @@ SDValue DAGCombiner::visitEXTRACT_SUBVECTOR(SDNode *N) {
       unsigned DestSrcRatio = DestNumElts / SrcNumElts;
       if ((NVT.getVectorNumElements() % DestSrcRatio) == 0) {
         unsigned NewExtNumElts = NVT.getVectorNumElements() / DestSrcRatio;
-        EVT NewExtVT = EVT::getVectorVT(*DAG.getContext(),
-                                        SrcVT.getScalarType(), NewExtNumElts);
-        if ((N->getConstantOperandVal(1) % DestSrcRatio) == 0 &&
-            TLI.isOperationLegalOrCustom(ISD::EXTRACT_SUBVECTOR, NewExtVT)) {
-          unsigned IndexValScaled = N->getConstantOperandVal(1) / DestSrcRatio;
+        EVT ScalarVT = SrcVT.getScalarType();
+        if ((N->getConstantOperandVal(1) % DestSrcRatio) == 0) {
           SDLoc DL(N);
-          SDValue NewIndex = DAG.getIntPtrConstant(IndexValScaled, DL);
-          SDValue NewExtract = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NewExtVT,
-                                           V.getOperand(0), NewIndex);
-          return DAG.getBitcast(NVT, NewExtract);
+          unsigned IndexValScaled = N->getConstantOperandVal(1) / DestSrcRatio;
+          EVT NewExtVT = EVT::getVectorVT(*DAG.getContext(),
+                                          ScalarVT, NewExtNumElts);
+          if (TLI.isOperationLegalOrCustom(ISD::EXTRACT_SUBVECTOR, NewExtVT)) {
+            SDValue NewIndex = DAG.getVectorIdxConstant(IndexValScaled, DL);
+            SDValue NewExtract = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NewExtVT,
+                                             V.getOperand(0), NewIndex);
+            return DAG.getBitcast(NVT, NewExtract);
+          }
         }
       }
     }
   }
 
-  // Combine:
-  //    (extract_subvec (concat V1, V2, ...), i)
-  // Into:
-  //    Vi if possible
-  // Only operand 0 is checked as 'concat' assumes all inputs of the same
-  // type.
-  if (V.getOpcode() == ISD::CONCAT_VECTORS && isa<ConstantSDNode>(Index) &&
-      V.getOperand(0).getValueType() == NVT) {
-    unsigned Idx = N->getConstantOperandVal(1);
-    unsigned NumElems = NVT.getVectorNumElements();
-    assert((Idx % NumElems) == 0 &&
-           "IDX in concat is not a multiple of the result vector length.");
-    return V->getOperand(Idx / NumElems);
+  if (V.getOpcode() == ISD::CONCAT_VECTORS && isa<ConstantSDNode>(Index)) {
+    EVT ConcatSrcVT = V.getOperand(0).getValueType();
+    assert(ConcatSrcVT.getVectorElementType() == NVT.getVectorElementType() &&
+           "Concat and extract subvector do not change element type");
+
+    unsigned ExtIdx = N->getConstantOperandVal(1);
+    unsigned ExtNumElts = NVT.getVectorNumElements();
+    assert(ExtIdx % ExtNumElts == 0 &&
+           "Extract index is not a multiple of the input vector length.");
+
+    unsigned ConcatSrcNumElts = ConcatSrcVT.getVectorNumElements();
+    unsigned ConcatOpIdx = ExtIdx / ConcatSrcNumElts;
+
+    // If the concatenated source types match this extract, it's a direct
+    // simplification:
+    // extract_subvec (concat V1, V2, ...), i --> Vi
+    if (ConcatSrcNumElts == ExtNumElts)
+      return V.getOperand(ConcatOpIdx);
+
+    // If the concatenated source vectors are a multiple length of this extract,
+    // then extract a fraction of one of those source vectors directly from a
+    // concat operand. Example:
+    //   v2i8 extract_subvec (v16i8 concat (v8i8 X), (v8i8 Y), 14 -->
+    //   v2i8 extract_subvec v8i8 Y, 6
+    if (ConcatSrcNumElts % ExtNumElts == 0) {
+      SDLoc DL(N);
+      unsigned NewExtIdx = ExtIdx - ConcatOpIdx * ConcatSrcNumElts;
+      assert(NewExtIdx + ExtNumElts <= ConcatSrcNumElts &&
+             "Trying to extract from >1 concat operand?");
+      assert(NewExtIdx % ExtNumElts == 0 &&
+             "Extract index is not a multiple of the input vector length.");
+      SDValue NewIndexC = DAG.getVectorIdxConstant(NewExtIdx, DL);
+      return DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, NVT,
+                         V.getOperand(ConcatOpIdx), NewIndexC);
+    }
   }
 
   V = peekThroughBitcasts(V);
@@ -19104,8 +19142,7 @@ static SDValue replaceShuffleOfInsert(ShuffleVectorSDNode *Shuf,
   // element used. Therefore, our new insert element occurs at the shuffle's
   // mask index value, not the insert's index value.
   // shuffle (insertelt v1, x, C), v2, mask --> insertelt v2, x, C'
-  SDValue NewInsIndex = DAG.getConstant(ShufOp0Index, SDLoc(Shuf),
-                                        Op0.getOperand(2).getValueType());
+  SDValue NewInsIndex = DAG.getVectorIdxConstant(ShufOp0Index, SDLoc(Shuf));
   return DAG.getNode(ISD::INSERT_VECTOR_ELT, SDLoc(Shuf), Op0.getValueType(),
                      Op1, Op0.getOperand(1), NewInsIndex);
 }
@@ -19202,7 +19239,7 @@ SDValue DAGCombiner::visitVECTOR_SHUFFLE(SDNode *N) {
       SDValue L = N0.getOperand(0), R = N0.getOperand(1);
       SDLoc DL(N);
       EVT EltVT = VT.getScalarType();
-      SDValue Index = DAG.getIntPtrConstant(SplatIndex, DL);
+      SDValue Index = DAG.getVectorIdxConstant(SplatIndex, DL);
       SDValue ExtL = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltVT, L, Index);
       SDValue ExtR = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltVT, R, Index);
       SDValue NewBO = DAG.getNode(N0.getOpcode(), DL, EltVT, ExtL, ExtR,
@@ -19284,6 +19321,30 @@ SDValue DAGCombiner::visitVECTOR_SHUFFLE(SDNode *N) {
        N0.getOperand(0).getValueType() == N1.getOperand(0).getValueType()))) {
     if (SDValue V = partitionShuffleOfConcats(N, DAG))
       return V;
+  }
+
+  // A shuffle of a concat of the same narrow vector can be reduced to use
+  // only low-half elements of a concat with undef:
+  // shuf (concat X, X), undef, Mask --> shuf (concat X, undef), undef, Mask'
+  if (N0.getOpcode() == ISD::CONCAT_VECTORS && N1.isUndef() &&
+      N0.getNumOperands() == 2 &&
+      N0.getOperand(0) == N0.getOperand(1)) {
+    int HalfNumElts = (int)NumElts / 2;
+    SmallVector<int, 8> NewMask;
+    for (unsigned i = 0; i != NumElts; ++i) {
+      int Idx = SVN->getMaskElt(i);
+      if (Idx >= HalfNumElts) {
+        assert(Idx < (int)NumElts && "Shuffle mask chooses undef op");
+        Idx -= HalfNumElts;
+      }
+      NewMask.push_back(Idx);
+    }
+    if (TLI.isShuffleMaskLegal(NewMask, VT)) {
+      SDValue UndefVec = DAG.getUNDEF(N0.getOperand(0).getValueType());
+      SDValue NewCat = DAG.getNode(ISD::CONCAT_VECTORS, SDLoc(N), VT,
+                                   N0.getOperand(0), UndefVec);
+      return DAG.getVectorShuffle(VT, SDLoc(N), NewCat, N1, NewMask);
+    }
   }
 
   // Attempt to combine a shuffle of 2 inputs of 'scalar sources' -
@@ -19520,11 +19581,10 @@ SDValue DAGCombiner::visitSCALAR_TO_VECTOR(SDNode *N) {
             return LegalShuffle;
           // If not we must truncate the vector.
           if (VT.getVectorNumElements() != InVecT.getVectorNumElements()) {
-            MVT IdxTy = TLI.getVectorIdxTy(DAG.getDataLayout());
-            SDValue ZeroIdx = DAG.getConstant(0, SDLoc(N), IdxTy);
-            EVT SubVT =
-                EVT::getVectorVT(*DAG.getContext(), InVecT.getVectorElementType(),
-                                 VT.getVectorNumElements());
+            SDValue ZeroIdx = DAG.getVectorIdxConstant(0, SDLoc(N));
+            EVT SubVT = EVT::getVectorVT(*DAG.getContext(),
+                                         InVecT.getVectorElementType(),
+                                         VT.getVectorNumElements());
             return DAG.getNode(ISD::EXTRACT_SUBVECTOR, SDLoc(N), SubVT,
                                LegalShuffle, ZeroIdx);
           }
@@ -19620,19 +19680,18 @@ SDValue DAGCombiner::visitINSERT_SUBVECTOR(SDNode *N) {
       EVT NewVT;
       SDLoc DL(N);
       SDValue NewIdx;
-      MVT IdxVT = TLI.getVectorIdxTy(DAG.getDataLayout());
       LLVMContext &Ctx = *DAG.getContext();
       unsigned NumElts = VT.getVectorNumElements();
       unsigned EltSizeInBits = VT.getScalarSizeInBits();
       if ((EltSizeInBits % N1SrcSVT.getSizeInBits()) == 0) {
         unsigned Scale = EltSizeInBits / N1SrcSVT.getSizeInBits();
         NewVT = EVT::getVectorVT(Ctx, N1SrcSVT, NumElts * Scale);
-        NewIdx = DAG.getConstant(InsIdx * Scale, DL, IdxVT);
+        NewIdx = DAG.getVectorIdxConstant(InsIdx * Scale, DL);
       } else if ((N1SrcSVT.getSizeInBits() % EltSizeInBits) == 0) {
         unsigned Scale = N1SrcSVT.getSizeInBits() / EltSizeInBits;
         if ((NumElts % Scale) == 0 && (InsIdx % Scale) == 0) {
           NewVT = EVT::getVectorVT(Ctx, N1SrcSVT, NumElts / Scale);
-          NewIdx = DAG.getConstant(InsIdx / Scale, DL, IdxVT);
+          NewIdx = DAG.getVectorIdxConstant(InsIdx / Scale, DL);
         }
       }
       if (NewIdx && hasOperation(ISD::INSERT_SUBVECTOR, NewVT)) {
@@ -19713,9 +19772,9 @@ SDValue DAGCombiner::visitVECREDUCE(SDNode *N) {
   // VECREDUCE over 1-element vector is just an extract.
   if (VT.getVectorNumElements() == 1) {
     SDLoc dl(N);
-    SDValue Res = DAG.getNode(
-        ISD::EXTRACT_VECTOR_ELT, dl, VT.getVectorElementType(), N0,
-        DAG.getConstant(0, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
+    SDValue Res =
+        DAG.getNode(ISD::EXTRACT_VECTOR_ELT, dl, VT.getVectorElementType(), N0,
+                    DAG.getVectorIdxConstant(0, dl));
     if (Res.getValueType() != N->getValueType(0))
       Res = DAG.getNode(ISD::ANY_EXTEND, dl, N->getValueType(0), Res);
     return Res;
@@ -19848,8 +19907,7 @@ static SDValue scalarizeBinOpOfSplats(SDNode *N, SelectionDAG &DAG) {
     return SDValue();
 
   SDLoc DL(N);
-  SDValue IndexC =
-      DAG.getConstant(Index0, DL, TLI.getVectorIdxTy(DAG.getDataLayout()));
+  SDValue IndexC = DAG.getVectorIdxConstant(Index0, DL);
   SDValue X = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltVT, N0, IndexC);
   SDValue Y = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, EltVT, N1, IndexC);
   SDValue ScalarBO = DAG.getNode(Opcode, DL, EltVT, X, Y, N->getFlags());
@@ -20793,9 +20851,11 @@ bool DAGCombiner::isAlias(SDNode *Op0, SDNode *Op1) const {
                      : (LSN->getAddressingMode() == ISD::PRE_DEC)
                            ? -1 * C->getSExtValue()
                            : 0;
+      uint64_t Size =
+          MemoryLocation::getSizeOrUnknown(LSN->getMemoryVT().getStoreSize());
       return {LSN->isVolatile(), LSN->isAtomic(), LSN->getBasePtr(),
               Offset /*base offset*/,
-              Optional<int64_t>(LSN->getMemoryVT().getStoreSize()),
+              Optional<int64_t>(Size),
               LSN->getMemOperand()};
     }
     if (const auto *LN = cast<LifetimeSDNode>(N))
@@ -21073,6 +21133,12 @@ bool DAGCombiner::parallelizeChainedStores(StoreSDNode *St) {
 
   // Do not handle stores to undef base pointers.
   if (BasePtr.getBase().isUndef())
+    return false;
+
+  // BaseIndexOffset assumes that offsets are fixed-size, which
+  // is not valid for scalable vectors where the offsets are
+  // scaled by `vscale`, so bail out early.
+  if (St->getMemoryVT().isScalableVector())
     return false;
 
   // Add ST's interval.

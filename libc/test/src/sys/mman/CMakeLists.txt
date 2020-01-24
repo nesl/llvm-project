@@ -1,5 +1,4 @@
-add_custom_target(libc_sys_mman_unittests)
-add_dependencies(check_libc libc_sys_mman_unittests)
+add_libc_testsuite(libc_sys_mman_unittests)
 
 add_libc_unittest(
   mmap_test
@@ -8,6 +7,8 @@ add_libc_unittest(
   SRCS
     mmap_test.cpp
   DEPENDS
+    errno_h
+    sys_mman_h
     mmap
     munmap
     __errno_location
