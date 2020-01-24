@@ -28,8 +28,14 @@
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include <functional> 
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <iomanip>
 #include <cassert>
 #include <cstdint>
+#include <openssl/sha.h>
 
 using namespace llvm;
 
@@ -172,6 +178,11 @@ public:
   unsigned fixMOVZ(const MCInst &MI, unsigned EncodedValue,
                    const MCSubtargetInfo &STI) const;
 
+
+  mutable bool isNOP = false;
+  mutable int hash=0;
+  mutable long sum=0;
+ // mutable void hashing(uint64_t &Binary,bool &isNOP, int &sum);
   void encodeInstruction(const MCInst &MI, raw_ostream &OS,
                          SmallVectorImpl<MCFixup> &Fixups,
                          const MCSubtargetInfo &STI) const override;
@@ -590,7 +601,8 @@ unsigned AArch64MCCodeEmitter::fixMOVZ(const MCInst &MI, unsigned EncodedValue,
 
 void AArch64MCCodeEmitter::encodeInstruction(const MCInst &MI, raw_ostream &OS,
                                              SmallVectorImpl<MCFixup> &Fixups,
-                                             const MCSubtargetInfo &STI) const {
+                                             const MCSubtargetInfo &STI) const{
+
   verifyInstructionPredicates(MI,
                               computeAvailableFeatures(STI.getFeatureBits()));
 
@@ -612,8 +624,58 @@ void AArch64MCCodeEmitter::encodeInstruction(const MCInst &MI, raw_ostream &OS,
 
   uint64_t Binary = getBinaryCodeForInstr(MI, Fixups, STI);
   support::endian::write<uint32_t>(OS, Binary, support::little);
+  
+  //llvm::errs()<<Binary<<"\n";
+  if(Binary==3573751839&&isNOP==true){
+      isNOP=false;
+      llvm::errs()<<"Sum: "<<sum<<"\n";
+      if(sum!=0){
+          std::string tmp=std::to_string(sum);
+	  unsigned char input[tmp.length()+1];
+	  for (int i=0;i<tmp.length();i++){
+		input[i]=tmp[i];
+		std::cout<<input[i];
+	  }
+	  unsigned char r[SHA_DIGEST_LENGTH];
+	  unsigned char hash[SHA_DIGEST_LENGTH*2];
+	  SHA1(input,sizeof(input)-1,r);
+	  //std::string r1(reinterpret_cast<char*>(r));
+          sum=0;
+          //llvm::errs()<<"Hash0: "<<r1<<"\n";
+	  //std::cout<<std::hex<<(0xff&r1)<<std::endl;
+	  for (int i=0; i < SHA_DIGEST_LENGTH; i++) {
+    		sprintf((char*)&(hash[i*2]), "%02x", r[i]);
+	  }
+	  printf("Hash: %s\n", hash);
+      }
+  }
+  if(isNOP==true){
+      sum+=Binary;
+      
+  }
+  if(Binary==3573751839&&isNOP==false){
+      isNOP=true;
+  }
+  
   ++MCNumEmitted; // Keep track of the # of mi's emitted.
 }
+
+/*void hashing(uint64_t &Binary,bool &isNOP,int &sum){
+  if(Binary==3573751839&&isNOP==false){
+      isNOP=true;
+  }
+  if(isNOP==true){
+      sum+=Binary;
+  }
+  if(Binary==3573751839&&isNOP==true){
+      isNOP=false;
+      if(sum!=0){
+          hash<int> result(sum);
+          sum=0;
+          llvm::errs()<<"Hash: "<<result<<"\n";
+      }
+  }
+}*/
 
 unsigned
 AArch64MCCodeEmitter::fixMulHigh(const MCInst &MI,
