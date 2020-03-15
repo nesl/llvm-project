@@ -1,5 +1,4 @@
-//===-- AppleObjCTrampolineHandler.cpp ----------------------------*- C++
-//-*-===//
+//===-- AppleObjCTrampolineHandler.cpp ------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,6 +9,7 @@
 #include "AppleObjCTrampolineHandler.h"
 #include "AppleThreadPlanStepThroughObjCTrampoline.h"
 
+#include "Plugins/TypeSystem/Clang/TypeSystemClang.h"
 #include "lldb/Breakpoint/StoppointCallbackContext.h"
 #include "lldb/Core/Debugger.h"
 #include "lldb/Core/Module.h"
@@ -19,7 +19,6 @@
 #include "lldb/Expression/FunctionCaller.h"
 #include "lldb/Expression/UserExpression.h"
 #include "lldb/Expression/UtilityFunction.h"
-#include "lldb/Symbol/TypeSystemClang.h"
 #include "lldb/Symbol/Symbol.h"
 #include "lldb/Target/ABI.h"
 #include "lldb/Target/ExecutionContext.h"
@@ -319,7 +318,7 @@ void AppleObjCTrampolineHandler::AppleObjCVTables::VTableRegion::SetUpRegion() {
   const uint16_t descriptor_size = data.GetU16(&offset);
   const size_t num_descriptors = data.GetU32(&offset);
 
-  m_next_region = data.GetPointer(&offset);
+  m_next_region = data.GetAddress(&offset);
 
   // If the header size is 0, that means we've come in too early before this
   // data is set up.
@@ -548,7 +547,7 @@ bool AppleObjCTrampolineHandler::AppleObjCVTables::RefreshTrampolines(
     error = argument_values.GetValueAtIndex(0)->GetValueAsData(&exe_ctx, data,
                                                                nullptr);
     lldb::offset_t offset = 0;
-    lldb::addr_t region_addr = data.GetPointer(&offset);
+    lldb::addr_t region_addr = data.GetAddress(&offset);
 
     if (region_addr != 0)
       vtable_handler->ReadRegions(region_addr);

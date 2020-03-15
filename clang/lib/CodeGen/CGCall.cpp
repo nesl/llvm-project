@@ -1748,15 +1748,14 @@ void CodeGenModule::ConstructDefaultFnAttrList(StringRef Name, bool HasOptnone,
     if (CodeGenOpts.NullPointerIsValid)
       FuncAttrs.addAttribute("null-pointer-is-valid", "true");
 
-    // TODO: Omit attribute when the default is IEEE.
-    if (CodeGenOpts.FPDenormalMode != llvm::DenormalMode::Invalid)
+    if (CodeGenOpts.FPDenormalMode != llvm::DenormalMode::getIEEE())
       FuncAttrs.addAttribute("denormal-fp-math",
-                             llvm::denormalModeName(CodeGenOpts.FPDenormalMode));
-
-    if (CodeGenOpts.FP32DenormalMode != llvm::DenormalMode::Invalid)
+                             CodeGenOpts.FPDenormalMode.str());
+    if (CodeGenOpts.FP32DenormalMode != CodeGenOpts.FPDenormalMode) {
       FuncAttrs.addAttribute(
           "denormal-fp-math-f32",
-          llvm::denormalModeName(CodeGenOpts.FP32DenormalMode));
+          CodeGenOpts.FP32DenormalMode.str());
+    }
 
     FuncAttrs.addAttribute("no-trapping-math",
                            llvm::toStringRef(CodeGenOpts.NoTrappingMath));
@@ -1832,6 +1831,42 @@ void CodeGenModule::AddDefaultFnAttrs(llvm::Function &F) {
   F.addAttributes(llvm::AttributeList::FunctionIndex, FuncAttrs);
 }
 
+static void addNoBuiltinAttributes(llvm::AttrBuilder &FuncAttrs,
+                                   const LangOptions &LangOpts,
+                                   const NoBuiltinAttr *NBA = nullptr) {
+  auto AddNoBuiltinAttr = [&FuncAttrs](StringRef BuiltinName) {
+    SmallString<32> AttributeName;
+    AttributeName += "no-builtin-";
+    AttributeName += BuiltinName;
+    FuncAttrs.addAttribute(AttributeName);
+  };
+
+  // First, handle the language options passed through -fno-builtin.
+  if (LangOpts.NoBuiltin) {
+    // -fno-builtin disables them all.
+    FuncAttrs.addAttribute("no-builtins");
+    return;
+  }
+
+  // Then, add attributes for builtins specified through -fno-builtin-<name>.
+  llvm::for_each(LangOpts.NoBuiltinFuncs, AddNoBuiltinAttr);
+
+  // Now, let's check the __attribute__((no_builtin("...")) attribute added to
+  // the source.
+  if (!NBA)
+    return;
+
+  // If there is a wildcard in the builtin names specified through the
+  // attribute, disable them all.
+  if (llvm::is_contained(NBA->builtinNames(), "*")) {
+    FuncAttrs.addAttribute("no-builtins");
+    return;
+  }
+
+  // And last, add the rest of the builtin names.
+  llvm::for_each(NBA->builtinNames(), AddNoBuiltinAttr);
+}
+
 void CodeGenModule::ConstructAttributeList(
     StringRef Name, const CGFunctionInfo &FI, CGCalleeInfo CalleeInfo,
     llvm::AttributeList &AttrList, unsigned &CallingConv, bool AttrOnCallSite) {
@@ -1850,6 +1885,8 @@ void CodeGenModule::ConstructAttributeList(
   const Decl *TargetDecl = CalleeInfo.getCalleeDecl().getDecl();
 
   bool HasOptnone = false;
+  // The NoBuiltinAttr attached to a TargetDecl (only allowed on FunctionDecls).
+  const NoBuiltinAttr *NBA = nullptr;
   // FIXME: handle sseregparm someday...
   if (TargetDecl) {
     if (TargetDecl->hasAttr<ReturnsTwiceAttr>())
@@ -1868,6 +1905,13 @@ void CodeGenModule::ConstructAttributeList(
     if (const FunctionDecl *Fn = dyn_cast<FunctionDecl>(TargetDecl)) {
       AddAttributesFromFunctionProtoType(
           getContext(), FuncAttrs, Fn->getType()->getAs<FunctionProtoType>());
+      if (AttrOnCallSite && Fn->isReplaceableGlobalAllocationFunction()) {
+        // A sane operator new returns a non-aliasing pointer.
+        auto Kind = Fn->getDeclName().getCXXOverloadedOperator();
+        if (getCodeGenOpts().AssumeSaneOperatorNew &&
+            (Kind == OO_New || Kind == OO_Array_New))
+          RetAttrs.addAttribute(llvm::Attribute::NoAlias);
+      }
       const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(Fn);
       const bool IsVirtualCall = MD && MD->isVirtual();
       // Don't use [[noreturn]], _Noreturn or [[no_builtin]] for a call to a
@@ -1875,22 +1919,7 @@ void CodeGenModule::ConstructAttributeList(
       if (!(AttrOnCallSite && IsVirtualCall)) {
         if (Fn->isNoReturn())
           FuncAttrs.addAttribute(llvm::Attribute::NoReturn);
-
-        const auto *NBA = Fn->getAttr<NoBuiltinAttr>();
-        bool HasWildcard = NBA && llvm::is_contained(NBA->builtinNames(), "*");
-        if (getLangOpts().NoBuiltin || HasWildcard)
-          FuncAttrs.addAttribute("no-builtins");
-        else {
-          auto AddNoBuiltinAttr = [&FuncAttrs](StringRef BuiltinName) {
-            SmallString<32> AttributeName;
-            AttributeName += "no-builtin-";
-            AttributeName += BuiltinName;
-            FuncAttrs.addAttribute(AttributeName);
-          };
-          llvm::for_each(getLangOpts().NoBuiltinFuncs, AddNoBuiltinAttr);
-          if (NBA)
-            llvm::for_each(NBA->builtinNames(), AddNoBuiltinAttr);
-        }
+        NBA = Fn->getAttr<NoBuiltinAttr>();
       }
     }
 
@@ -1924,6 +1953,14 @@ void CodeGenModule::ConstructAttributeList(
                                  NumElemsParam);
     }
   }
+
+  // Attach "no-builtins" attributes to:
+  // * call sites: both `nobuiltin` and "no-builtins" or "no-builtin-<name>".
+  // * definitions: "no-builtins" or "no-builtin-<name>" only.
+  // The attributes can come from:
+  // * LangOpts: -ffreestanding, -fno-builtin, -fno-builtin-<name>
+  // * FunctionDecl attributes: __attribute__((no_builtin(...)))
+  addNoBuiltinAttributes(FuncAttrs, getLangOpts(), NBA);
 
   ConstructDefaultFnAttrList(Name, HasOptnone, AttrOnCallSite, FuncAttrs);
 
@@ -2023,8 +2060,8 @@ void CodeGenModule::ConstructAttributeList(
   if (const auto *RefTy = RetTy->getAs<ReferenceType>()) {
     QualType PTy = RefTy->getPointeeType();
     if (!PTy->isIncompleteType() && PTy->isConstantSizeType())
-      RetAttrs.addDereferenceableAttr(getContext().getTypeSizeInChars(PTy)
-                                        .getQuantity());
+      RetAttrs.addDereferenceableAttr(
+          getMinimumObjectSize(PTy).getQuantity());
     else if (getContext().getTargetAddressSpace(PTy) == 0 &&
              !CodeGenOpts.NullPointerIsValid)
       RetAttrs.addAttribute(llvm::Attribute::NonNull);
@@ -2133,8 +2170,8 @@ void CodeGenModule::ConstructAttributeList(
     if (const auto *RefTy = ParamType->getAs<ReferenceType>()) {
       QualType PTy = RefTy->getPointeeType();
       if (!PTy->isIncompleteType() && PTy->isConstantSizeType())
-        Attrs.addDereferenceableAttr(getContext().getTypeSizeInChars(PTy)
-                                       .getQuantity());
+        Attrs.addDereferenceableAttr(
+            getMinimumObjectSize(PTy).getQuantity());
       else if (getContext().getTargetAddressSpace(PTy) == 0 &&
                !CodeGenOpts.NullPointerIsValid)
         Attrs.addAttribute(llvm::Attribute::NonNull);
@@ -3007,6 +3044,11 @@ void CodeGenFunction::EmitReturnValueCheck(llvm::Value *RV) {
   if (!CurCodeDecl)
     return;
 
+  // If the return block isn't reachable, neither is this check, so don't emit
+  // it.
+  if (ReturnBlock.isValid() && ReturnBlock.getBlock()->use_empty())
+    return;
+
   ReturnsNonNullAttr *RetNNAttr = nullptr;
   if (SanOpts.has(SanitizerKind::ReturnsNonnullAttribute))
     RetNNAttr = CurCodeDecl->getAttr<ReturnsNonNullAttr>();
@@ -3027,7 +3069,7 @@ void CodeGenFunction::EmitReturnValueCheck(llvm::Value *RV) {
   } else {
     if (auto *DD = dyn_cast<DeclaratorDecl>(CurCodeDecl))
       if (auto *TSI = DD->getTypeSourceInfo())
-        if (auto FTL = TSI->getTypeLoc().castAs<FunctionTypeLoc>())
+        if (auto FTL = TSI->getTypeLoc().getAsAdjusted<FunctionTypeLoc>())
           AttrLoc = FTL.getReturnLoc().findNullabilityLoc();
     CheckKind = SanitizerKind::NullabilityReturn;
     Handler = SanitizerHandler::NullabilityReturn;
@@ -3856,6 +3898,10 @@ public:
     const auto *AlignmentCI = dyn_cast<llvm::ConstantInt>(Alignment);
     if (!AlignmentCI)
       return Attrs;
+    // We may legitimately have non-power-of-2 alignment here.
+    // If so, this is UB land, emit it via `@llvm.assume` instead.
+    if (!AlignmentCI->getValue().isPowerOf2())
+      return Attrs;
     llvm::AttributeList NewAttrs = maybeRaiseRetAlignmentAttribute(
         CGF.getLLVMContext(), Attrs,
         llvm::Align(
@@ -3870,7 +3916,7 @@ public:
   void EmitAsAnAssumption(SourceLocation Loc, QualType RetTy, RValue &Ret) {
     if (!AA)
       return;
-    CGF.EmitAlignmentAssumption(Ret.getScalarVal(), RetTy, Loc,
+    CGF.emitAlignmentAssumption(Ret.getScalarVal(), RetTy, Loc,
                                 AA->getLocation(), Alignment, OffsetCI);
     AA = nullptr; // We're done. Disallow doing anything else.
   }

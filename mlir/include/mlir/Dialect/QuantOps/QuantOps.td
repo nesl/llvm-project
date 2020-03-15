@@ -1,6 +1,6 @@
 //===- QuantOps.td - Quantization operation definition -----*- tablegen -*-===//
 //
-// Part of the MLIR Project, under the Apache License v2.0 with LLVM Exceptions.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
@@ -13,19 +13,15 @@
 #ifndef DIALECT_QUANTOPS_QUANT_OPS_
 #define DIALECT_QUANTOPS_QUANT_OPS_
 
-include "mlir/IR/OpBase.td"
-include "mlir/Dialect/QuantOps/QuantPredicates.td"
-
-def quant_Dialect : Dialect {
-  let name = "quant";
-}
+include "mlir/Dialect/QuantOps/QuantOpsBase.td"
+include "mlir/Interfaces/SideEffects.td"
 
 //===----------------------------------------------------------------------===//
 // Base classes
 //===----------------------------------------------------------------------===//
 
 class quant_Op<string mnemonic, list<OpTrait> traits> :
-    Op<quant_Dialect, mnemonic, traits>;
+    Op<Quantization_Dialect, mnemonic, traits>;
 
 //===----------------------------------------------------------------------===//
 // Quantization casts
